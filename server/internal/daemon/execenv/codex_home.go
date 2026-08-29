@@ -192,9 +192,9 @@ func classifyPerTaskWindowsSandbox(configFile string, configSyncErr error, share
 }
 
 // prepareCodexHomeWithOpts creates a per-task CODEX_HOME directory and seeds
-// it with config from the shared ~/.codex/ home. Auth is symlinked (shared),
-// config files are copied (isolated). The per-task config.toml gets a
-// daemon-managed sandbox block picked by codexSandboxPolicyFor.
+// it with config from the shared ~/.codex/ home. Auth and packages are linked
+// (shared), while config files are copied (isolated). The per-task config.toml
+// gets a daemon-managed sandbox block picked by codexSandboxPolicyFor.
 func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *slog.Logger) error {
 	sharedHome := resolveSharedCodexHome()
 	freshHome := false
@@ -267,6 +267,10 @@ func prepareCodexHomeWithOpts(codexHome string, opts CodexHomeOptions, logger *s
 		if removeErr := os.RemoveAll(filepath.Join(codexHome, codexModelsCacheFile)); removeErr != nil {
 			return fmt.Errorf("sync codex models cache: %v; discard unsafe cache: %w", err, removeErr)
 		}
+	}
+
+	if err := exposeSharedCodexPackages(codexHome, sharedHome); err != nil {
+		logger.Warn("execenv: codex-home packages exposure failed", "error", err)
 	}
 
 	if err := exposeSharedCodexPluginCache(codexHome, sharedHome); err != nil {
@@ -1228,6 +1232,35 @@ func resolveCodexConfigPath(configPath, sharedHome, key string) (string, error) 
 		return "", fmt.Errorf("%s %q uses unsupported ~user expansion", key, configPath)
 	}
 	return filepath.Join(sharedHome, filepath.Clean(configPath)), nil
+}
+
+func exposeSharedCodexPackages(codexHome, sharedHome string) error {
+	src := filepath.Join(sharedHome, "packages")
+	dst := filepath.Join(codexHome, "packages")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		return fmt.Errorf("create shared packages dir: %w", err)
+	}
+
+	if fi, err := os.Lstat(dst); err == nil {
+		isLink := fi.Mode()&os.ModeSymlink != 0
+		if isLink {
+			if target, readlinkErr := os.Readlink(dst); readlinkErr == nil && sameCodexPath(target, src) {
+				return nil
+			}
+			if err := os.Remove(dst); err != nil {
+				return fmt.Errorf("remove stale packages link: %w", err)
+			}
+		} else {
+			if err := os.RemoveAll(dst); err != nil {
+				return fmt.Errorf("remove stale packages path: %w", err)
+			}
+		}
+	}
+
+	if err := createDirLink(src, dst); err != nil {
+		return fmt.Errorf("expose shared packages: %w", err)
+	}
+	return nil
 }
 
 func exposeSharedCodexPluginCache(codexHome, sharedHome string) error {

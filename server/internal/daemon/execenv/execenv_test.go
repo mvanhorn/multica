@@ -2859,6 +2859,101 @@ func TestPrepareCodexHomeSeedsFromShared(t *testing.T) {
 	}
 }
 
+func TestPrepareCodexHomeSharesPackages(t *testing.T) {
+	// Cannot use t.Parallel() with t.Setenv.
+
+	sharedHome := t.TempDir()
+	t.Setenv("CODEX_HOME", sharedHome)
+	sharedPackages := filepath.Join(sharedHome, "packages")
+
+	writeRelease := func(t *testing.T, root, version string) string {
+		t.Helper()
+		helper := filepath.Join(root, "standalone", "releases", version, "codex-windows-sandbox-setup.exe")
+		if err := os.MkdirAll(filepath.Dir(helper), 0o755); err != nil {
+			t.Fatalf("create standalone release %s: %v", version, err)
+		}
+		if err := os.WriteFile(helper, []byte(version), 0o755); err != nil {
+			t.Fatalf("write standalone release %s: %v", version, err)
+		}
+		return helper
+	}
+	assertRelease := func(t *testing.T, codexHome, version string) {
+		t.Helper()
+		helper := filepath.Join(codexHome, "packages", "standalone", "releases", version, "codex-windows-sandbox-setup.exe")
+		data, err := os.ReadFile(helper)
+		if err != nil {
+			t.Fatalf("shared standalone release %s not exposed: %v", version, err)
+		}
+		if string(data) != version {
+			t.Errorf("standalone release helper content = %q, want %q", data, version)
+		}
+	}
+
+	t.Run("creates missing store and follows updates on reuse", func(t *testing.T) {
+		codexHome := filepath.Join(t.TempDir(), "codex-home")
+		if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+			t.Fatalf("prepareCodexHome failed: %v", err)
+		}
+		if fi, err := os.Stat(sharedPackages); err != nil || !fi.IsDir() {
+			t.Fatalf("shared packages store not created: info=%v err=%v", fi, err)
+		}
+
+		writeRelease(t, sharedPackages, "0.149.0")
+		assertRelease(t, codexHome, "0.149.0")
+		if err := os.RemoveAll(filepath.Join(sharedPackages, "standalone", "releases", "0.149.0")); err != nil {
+			t.Fatalf("remove old shared release: %v", err)
+		}
+		writeRelease(t, sharedPackages, "0.149.1")
+
+		if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+			t.Fatalf("reuse prepareCodexHome failed: %v", err)
+		}
+		assertRelease(t, codexHome, "0.149.1")
+		oldRelease := filepath.Join(codexHome, "packages", "standalone", "releases", "0.149.0")
+		if _, err := os.Stat(oldRelease); !os.IsNotExist(err) {
+			t.Fatalf("old standalone release still exposed after reuse: %v", err)
+		}
+	})
+
+	t.Run("replaces stale local directory", func(t *testing.T) {
+		codexHome := filepath.Join(t.TempDir(), "codex-home")
+		writeRelease(t, filepath.Join(codexHome, "packages"), "0.148.0")
+		writeRelease(t, sharedPackages, "0.150.0")
+
+		if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+			t.Fatalf("prepareCodexHome failed: %v", err)
+		}
+		assertRelease(t, codexHome, "0.150.0")
+		staleRelease := filepath.Join(codexHome, "packages", "standalone", "releases", "0.148.0")
+		if _, err := os.Stat(staleRelease); !os.IsNotExist(err) {
+			t.Fatalf("stale task-local release still exposed: %v", err)
+		}
+	})
+
+	t.Run("repairs wrong link and keeps correct link usable", func(t *testing.T) {
+		codexHome := filepath.Join(t.TempDir(), "codex-home")
+		if err := os.MkdirAll(codexHome, 0o755); err != nil {
+			t.Fatalf("create codex home: %v", err)
+		}
+		wrongPackages := filepath.Join(t.TempDir(), "packages")
+		writeRelease(t, wrongPackages, "0.147.0")
+		if err := createDirLink(wrongPackages, filepath.Join(codexHome, "packages")); err != nil {
+			t.Fatalf("create wrong packages link: %v", err)
+		}
+		writeRelease(t, sharedPackages, "0.151.0")
+
+		if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+			t.Fatalf("prepareCodexHome failed: %v", err)
+		}
+		assertRelease(t, codexHome, "0.151.0")
+		if err := prepareCodexHome(codexHome, testLogger()); err != nil {
+			t.Fatalf("second prepareCodexHome failed: %v", err)
+		}
+		writeRelease(t, sharedPackages, "0.151.1")
+		assertRelease(t, codexHome, "0.151.1")
+	})
+}
+
 func TestPrepareCodexHomeCopiesRelativeModelCatalog(t *testing.T) {
 	// Cannot use t.Parallel() with t.Setenv.
 
@@ -3416,8 +3511,8 @@ func TestPrepareCodexHomeSkipsMissingFiles(t *testing.T) {
 		t.Fatalf("prepareCodexHome failed: %v", err)
 	}
 
-	// Directory should contain task-local sessions, the model-cache config
-	// binding, and auto-generated config.toml.
+	// Directory should contain task-local sessions, shared plugin/package
+	// exposures, the model-cache config binding, and auto-generated config.toml.
 	entries, err := os.ReadDir(codexHome)
 	if err != nil {
 		t.Fatalf("failed to read codex-home: %v", err)
@@ -3435,11 +3530,14 @@ func TestPrepareCodexHomeSkipsMissingFiles(t *testing.T) {
 	if !entryNames["plugins"] {
 		t.Error("expected plugins directory for plugin cache exposure")
 	}
+	if !entryNames["packages"] {
+		t.Error("expected packages directory for shared package exposure")
+	}
 	if !entryNames[codexModelsCacheBindingFile] {
 		t.Error("expected models cache config binding")
 	}
 	for name := range entryNames {
-		if name != "sessions" && name != "config.toml" && name != "plugins" && name != codexModelsCacheBindingFile {
+		if name != "sessions" && name != "config.toml" && name != "plugins" && name != "packages" && name != codexModelsCacheBindingFile {
 			t.Errorf("unexpected entry: %s", name)
 		}
 	}
@@ -3458,6 +3556,9 @@ func TestPrepareCodexHomeSkipsMissingFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(codexHome, "plugins", "cache")); err != nil {
 		t.Fatalf("missing shared plugin cache exposure should still be tolerated and created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(codexHome, "packages")); err != nil {
+		t.Fatalf("missing shared packages exposure should still be tolerated and created: %v", err)
 	}
 }
 
