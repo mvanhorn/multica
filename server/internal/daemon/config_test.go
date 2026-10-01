@@ -1357,22 +1357,9 @@ func TestLoadConfig_SkipsLoginShellWhenLookPathSucceeds(t *testing.T) {
 func TestLoadConfig_UsesCodexDesktopAppBundleFallback(t *testing.T) {
 	pathDir := t.TempDir()
 	fakeCodex := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
-	if err := os.MkdirAll(filepath.Dir(fakeCodex), 0o755); err != nil {
-		t.Fatalf("mkdir fake Codex bundle: %v", err)
-	}
-	if err := os.WriteFile(fakeCodex, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write fake Codex bundle CLI: %v", err)
-	}
-
-	oldBundlePaths := codexDesktopAppBundlePaths
-	codexDesktopAppBundlePaths = func() []string { return []string{fakeCodex} }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
-
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
-	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	writeFakeAgentCLI(t, fakeCodex)
+	isolateCodexBundleDiscovery(t, []string{fakeCodex})
 	t.Setenv("MULTICA_CODEX_MODEL", "gpt-5")
-	pinNonCodexAgentsToMissingPaths(t)
 
 	cfg, err := LoadConfig(Overrides{
 		ServerURL:      "http://localhost:0",
@@ -1395,29 +1382,18 @@ func TestLoadConfig_UsesCodexDesktopAppBundleFallback(t *testing.T) {
 
 // Regression for #5205: after OpenAI moved the Desktop app to ChatGPT.app,
 // Multica must resolve the bundled CLI under ChatGPT.app (and prefer it over
-// the legacy Codex.app path when both exist).
+// the legacy Codex.app path when both exist). Nested CodexCLI.app is absent
+// here so the older flat ChatGPT layout still discovers.
 func TestLoadConfig_UsesChatGPTAppBundleCodexPath(t *testing.T) {
 	pathDir := t.TempDir()
+	fakeNested := nestedChatGPTCodexPath(pathDir)
 	fakeChatGPT := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex")
 	fakeLegacy := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
 	for _, p := range []string{fakeChatGPT, fakeLegacy} {
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-			t.Fatalf("write fake CLI: %v", err)
-		}
+		writeFakeAgentCLI(t, p)
 	}
 
-	oldBundlePaths := codexDesktopAppBundlePaths
-	// Prefer ChatGPT first, matching production ordering.
-	codexDesktopAppBundlePaths = func() []string { return []string{fakeChatGPT, fakeLegacy} }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
-
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
-	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
-	pinNonCodexAgentsToMissingPaths(t)
+	isolateCodexBundleDiscovery(t, []string{fakeNested, fakeChatGPT, fakeLegacy})
 
 	cfg, err := LoadConfig(Overrides{
 		ServerURL:      "http://localhost:0",
@@ -1435,62 +1411,87 @@ func TestLoadConfig_UsesChatGPTAppBundleCodexPath(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_UsesNestedChatGPTAppBundleCodexPath(t *testing.T) {
+	pathDir := t.TempDir()
+	fakeNested := nestedChatGPTCodexPath(pathDir)
+	writeFakeAgentCLI(t, fakeNested)
+	isolateCodexBundleDiscovery(t, []string{fakeNested})
+	t.Setenv("MULTICA_CODEX_MODEL", "gpt-5")
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex agent from nested ChatGPT.app bundle, got %#v", cfg.Agents)
+	}
+	if got.Path != fakeNested {
+		t.Fatalf("codex path = %q, want nested ChatGPT.app path %q", got.Path, fakeNested)
+	}
+	if got.Command != "codex" {
+		t.Fatalf("codex command = %q, want codex", got.Command)
+	}
+	if got.Model != "gpt-5" {
+		t.Fatalf("codex model = %q, want gpt-5", got.Model)
+	}
+}
+
+func TestLoadConfig_PrefersNestedChatGPTAppBundleOverFlat(t *testing.T) {
+	pathDir := t.TempDir()
+	fakeNested := nestedChatGPTCodexPath(pathDir)
+	fakeFlat := filepath.Join(pathDir, "ChatGPT.app", "Contents", "Resources", "codex")
+	fakeLegacy := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
+	for _, p := range []string{fakeNested, fakeFlat, fakeLegacy} {
+		writeFakeAgentCLI(t, p)
+	}
+	isolateCodexBundleDiscovery(t, []string{fakeNested, fakeFlat, fakeLegacy})
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex agent from nested ChatGPT.app bundle, got %#v", cfg.Agents)
+	}
+	if got.Path != fakeNested {
+		t.Fatalf("codex path = %q, want nested ChatGPT.app path %q", got.Path, fakeNested)
+	}
+}
+
 func TestCodexDesktopAppBundlePaths_IncludesChatGPTAndLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
 	paths := codexDesktopAppBundlePaths()
-	var hasChatGPT, hasLegacy bool
-	for _, p := range paths {
-		if strings.Contains(p, "ChatGPT.app") && strings.HasSuffix(filepath.ToSlash(p), "Contents/Resources/codex") {
-			hasChatGPT = true
-		}
-		if strings.Contains(p, "Codex.app") && strings.HasSuffix(filepath.ToSlash(p), "Contents/Resources/codex") {
-			hasLegacy = true
-		}
+	want := []string{
+		"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+		"/Applications/ChatGPT.app/Contents/Resources/codex",
+		"/Applications/Codex.app/Contents/Resources/codex",
+		filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
+		filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex"),
+		filepath.Join(home, "Applications", "Codex.app", "Contents", "Resources", "codex"),
 	}
-	if !hasChatGPT {
-		t.Fatalf("codexDesktopAppBundlePaths missing ChatGPT.app entry: %#v", paths)
-	}
-	if !hasLegacy {
-		t.Fatalf("codexDesktopAppBundlePaths missing legacy Codex.app entry: %#v", paths)
-	}
-	// New path must be preferred (listed before legacy).
-	chatgptIdx, legacyIdx := -1, -1
-	for i, p := range paths {
-		if chatgptIdx < 0 && strings.Contains(p, "ChatGPT.app") {
-			chatgptIdx = i
-		}
-		if legacyIdx < 0 && strings.Contains(p, "Codex.app") {
-			legacyIdx = i
-		}
-	}
-	if chatgptIdx < 0 || legacyIdx < 0 || chatgptIdx > legacyIdx {
-		t.Fatalf("expected ChatGPT.app before Codex.app, got indices chat=%d legacy=%d paths=%#v", chatgptIdx, legacyIdx, paths)
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("codexDesktopAppBundlePaths() = %#v, want %#v", paths, want)
 	}
 }
 
 func TestLoadConfig_CodexDesktopFallbackDoesNotOverrideExplicitPath(t *testing.T) {
 	pathDir := t.TempDir()
 	fakeCodex := filepath.Join(pathDir, "Codex.app", "Contents", "Resources", "codex")
-	if err := os.MkdirAll(filepath.Dir(fakeCodex), 0o755); err != nil {
-		t.Fatalf("mkdir fake Codex bundle: %v", err)
-	}
-	if err := os.WriteFile(fakeCodex, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write fake Codex bundle CLI: %v", err)
-	}
-
-	oldBundlePaths := codexDesktopAppBundlePaths
-	codexDesktopAppBundlePaths = func() []string { return []string{fakeCodex} }
-	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
-
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
-	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	writeFakeAgentCLI(t, fakeCodex)
+	isolateCodexBundleDiscovery(t, []string{fakeCodex})
 	t.Setenv("MULTICA_CODEX_PATH", filepath.Join(t.TempDir(), "missing-codex"))
-	pinNonCodexAgentsToMissingPaths(t)
-	fakeClaude := filepath.Join(t.TempDir(), "claude")
-	if err := os.WriteFile(fakeClaude, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write fake claude: %v", err)
-	}
-	t.Setenv("MULTICA_CLAUDE_PATH", fakeClaude)
+	stageFakeClaudeForLoadConfig(t)
 
 	cfg, err := LoadConfig(Overrides{
 		ServerURL:      "http://localhost:0",
@@ -1501,6 +1502,93 @@ func TestLoadConfig_CodexDesktopFallbackDoesNotOverrideExplicitPath(t *testing.T
 	}
 	if got, ok := cfg.Agents["codex"]; ok {
 		t.Fatalf("explicit missing MULTICA_CODEX_PATH should not fall back to Desktop bundle, got %#v", got)
+	}
+}
+
+func TestLoadConfig_ExplicitValidCodexPathWinsOverDesktopBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fixture is unavailable on Windows")
+	}
+	pathDir := t.TempDir()
+	fakeNested := nestedChatGPTCodexPath(pathDir)
+	writeFakeAgentCLI(t, fakeNested)
+	explicit := filepath.Join(t.TempDir(), "explicit-codex")
+	writeFakeAgentCLI(t, explicit)
+	isolateCodexBundleDiscovery(t, []string{fakeNested})
+	t.Setenv("MULTICA_CODEX_PATH", explicit)
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex from explicit MULTICA_CODEX_PATH, got %#v", cfg.Agents)
+	}
+	if got.Path != explicit {
+		t.Fatalf("codex path = %q, want explicit override %q", got.Path, explicit)
+	}
+}
+
+func TestLoadConfig_PATHCodexWinsOverDesktopBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fixture is unavailable on Windows")
+	}
+	pathDir := t.TempDir()
+	fakeNested := nestedChatGPTCodexPath(pathDir)
+	writeFakeAgentCLI(t, fakeNested)
+
+	binDir := t.TempDir()
+	pathCodex := filepath.Join(binDir, "codex")
+	writeFakeAgentCLI(t, pathCodex)
+
+	oldBundlePaths := codexDesktopAppBundlePaths
+	codexDesktopAppBundlePaths = func() []string { return []string{fakeNested} }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = oldBundlePaths })
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	t.Setenv("MULTICA_CODEX_PATH", "")
+	pinNonCodexAgentsToMissingPaths(t)
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got, ok := cfg.Agents["codex"]
+	if !ok {
+		t.Fatalf("expected codex from PATH, got %#v", cfg.Agents)
+	}
+	want, err := filepath.EvalSymlinks(pathCodex)
+	if err != nil {
+		t.Fatalf("eval PATH codex: %v", err)
+	}
+	if got.Path != want {
+		t.Fatalf("codex path = %q, want PATH executable %q", got.Path, want)
+	}
+}
+
+func TestLoadConfig_MissingCodexBundleDoesNotFabricateEntry(t *testing.T) {
+	missing := nestedChatGPTCodexPath(t.TempDir())
+	isolateCodexBundleDiscovery(t, []string{missing})
+	stageFakeClaudeForLoadConfig(t)
+
+	cfg, err := LoadConfig(Overrides{
+		ServerURL:      "http://localhost:0",
+		WorkspacesRoot: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got, ok := cfg.Agents["codex"]; ok {
+		t.Fatalf("missing bundle paths must not fabricate a Codex entry, got %#v", got)
 	}
 }
 
@@ -1523,6 +1611,39 @@ func pinNonCodexAgentsToMissingPaths(t *testing.T) {
 	} {
 		t.Setenv(name, filepath.Join(missingDir, strings.ToLower(name)))
 	}
+}
+
+func nestedChatGPTCodexPath(root string) string {
+	return filepath.Join(root, "ChatGPT.app", "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex")
+}
+
+func writeFakeAgentCLI(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake CLI %s: %v", path, err)
+	}
+}
+
+func isolateCodexBundleDiscovery(t *testing.T, candidates []string) {
+	t.Helper()
+	old := codexDesktopAppBundlePaths
+	codexDesktopAppBundlePaths = func() []string { return candidates }
+	t.Cleanup(func() { codexDesktopAppBundlePaths = old })
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "fish"))
+	t.Setenv("MULTICA_DAEMON_ID", "11111111-1111-1111-1111-111111111111")
+	t.Setenv("MULTICA_CODEX_PATH", "")
+	pinNonCodexAgentsToMissingPaths(t)
+}
+
+func stageFakeClaudeForLoadConfig(t *testing.T) {
+	t.Helper()
+	fakeClaude := filepath.Join(t.TempDir(), "claude")
+	writeFakeAgentCLI(t, fakeClaude)
+	t.Setenv("MULTICA_CLAUDE_PATH", fakeClaude)
 }
 
 // =============================================================================

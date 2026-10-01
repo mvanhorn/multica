@@ -978,17 +978,20 @@ var defaultAgentCommandNames = append([]string{
 
 // codexDesktopAppBundlePaths returns candidate macOS app-bundle locations for
 // the bundled Codex CLI. OpenAI relocated the Desktop app from Codex.app to
-// ChatGPT.app (#5205). Candidates are ordered by install location first
-// (system /Applications before user ~/Applications); within each location the
-// new ChatGPT.app path is tried before the legacy Codex.app path, so updated
-// installs win while older installs still resolve.
+// ChatGPT.app (#5205) and later nested the CLI inside CodexCLI.app (GH #8943).
+// Candidates are ordered by install location first (system /Applications
+// before user ~/Applications); within each location the nested ChatGPT.app
+// path is tried before the flat ChatGPT.app path and the legacy Codex.app
+// path, so updated installs win while older installs still resolve.
 var codexDesktopAppBundlePaths = func() []string {
 	paths := []string{
+		"/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
 		"/Applications/ChatGPT.app/Contents/Resources/codex",
 		"/Applications/Codex.app/Contents/Resources/codex",
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		paths = append(paths,
+			filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex-cli", "CodexCLI.app", "Contents", "MacOS", "codex"),
 			filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources", "codex"),
 			filepath.Join(home, "Applications", "Codex.app", "Contents", "Resources", "codex"),
 		)
